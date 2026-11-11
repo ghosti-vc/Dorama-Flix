@@ -1,13 +1,19 @@
 {
   "id": "dorama-flix",
   "name": "Dorama-Flix",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "apiVersion": 9,
   "entry": "plugin.js",
   "author": "ghosti-vc",
   "homepage": "https://github.com/ghosti-vc/Dorama-Flix",
   "description": "Doramas en español de DoramasFlix y DoramasYT: catálogo, películas, búsqueda y capítulos en latino y subtitulado.",
-  "capabilities": ["home", "browse", "search", "episodes", "resolve"],
+  "capabilities": [
+    "home",
+    "browse",
+    "search",
+    "episodes",
+    "resolve"
+  ],
   "hosts": [
     "doramasflix.io",
     "user-api.fluxcedene.net",
