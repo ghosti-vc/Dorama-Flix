@@ -1,11 +1,13 @@
 // Dorama-Flix - doramas en español de DoramasFlix y DoramasYT.
 // Catálogo, películas, búsqueda, capítulos y reproducción (latino y subtitulado).
 // DoramasFlix se lee por su API pública (GraphQL); DoramasYT, por sus páginas.
+// Las filas se arman con DoramasFlix primero; DoramasYT solo completa lo que falte para llenarlas.
 
 const DY = "https://www.doramasyt.com";
 const DF = "https://doramasflix.io";
 const DF_API = "https://user-api.fluxcedene.net/graphql";
 const HOME_ROW = 20;
+const PAGE_FILL = 24; // lo que llena una página de "Ver más" (lo que trae DoramasFlix por página)
 const MAX_RESULTS = 100;
 const CAT_VIEW = 60;  // títulos por tanda de "Ver más"
 const CAT_MAX = 100;  // tope de Kino por página
@@ -68,6 +70,7 @@ async function getHtml(url) {
 // ---- Secciones: cada una junta varias fuentes y quita los títulos repetidos -------------------
 
 // site: "df" = DoramasFlix (API), "dy" = DoramasYT (páginas).
+// El orden de "parts" es el orden de prioridad: la primera fuente llena la fila y las siguientes solo completan.
 const SECTIONS = {
   doramas: { parts: [
     { site: "df", kind: "d" },
@@ -237,20 +240,22 @@ function mergeDupes(items) {
   });
 }
 
-// Una página de una sección: pide todas sus fuentes a la vez, intercala sus títulos y quita los repetidos.
-async function sectionPage(ref, n) {
+// Una página de una sección: pide todas sus fuentes a la vez y las junta EN ORDEN DE PRIORIDAD
+// (DoramasFlix primero, DoramasYT detrás), quitando los repetidos.
+// "need" es cuántos títulos llenan la página: lo que sobre de la fuente secundaria no se muestra,
+// así que DoramasYT solo entra cuando DoramasFlix no alcanza a llenarla (o no respondió).
+async function sectionPage(ref, n, need) {
   const sec = SECTIONS[ref];
   const res = await Promise.allSettled(sec.parts.map((p) => partPage(p, n)));
   const ok = res.filter((r) => r.status === "fulfilled");
   if (!ok.length) throw res[0].reason;
-  const lists = ok.map((r) => r.value.items);
   const mixed = [];
-  const longest = Math.max.apply(null, lists.map((l) => l.length));
-  for (let i = 0; i < longest; i++) {
-    for (const l of lists) if (l[i]) mixed.push(l[i]);
-  }
-  // Prioridad a latino: dentro de cada página, primero los títulos que están en latino.
-  return { items: latinoFirst(mergeDupes(mixed)), hasNext: ok.some((r) => r.value.hasNext) };
+  for (const r of ok) for (const x of r.value.items) mixed.push(x);
+  const merged = mergeDupes(mixed);
+  // Con una sola fuente que respondió (o una sección de una sola fuente) no se recorta nada.
+  const cap = ok.length > 1 ? (need || PAGE_FILL) : Infinity;
+  // Prioridad a latino: dentro de la página ya llena, primero los títulos que están en latino.
+  return { items: latinoFirst(merged.slice(0, cap)), hasNext: ok.some((r) => r.value.hasNext) };
 }
 
 export async function home() {
@@ -261,7 +266,7 @@ export async function home() {
     { id: "row-latino", ref: "latino", title: tr("En Latino", "In Latin Spanish") },
     { id: "row-peliculas", ref: "peliculas", title: tr("Películas", "Movies") },
   ];
-  const res = await Promise.allSettled(defs.map((d) => sectionPage(d.ref, 1)));
+  const res = await Promise.allSettled(defs.map((d) => sectionPage(d.ref, 1, HOME_ROW)));
   const rows = [];
   res.forEach((r, i) => {
     if (r.status !== "fulfilled") { log("home: falló " + defs[i].id); return; }
