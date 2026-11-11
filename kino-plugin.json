@@ -1,7 +1,7 @@
 {
   "id": "dorama-flix",
   "name": "Dorama-Flix",
-  "version": "1.0.4",
+  "version": "1.0.10",
   "apiVersion": 9,
   "entry": "plugin.js",
   "author": "ghosti-vc",
