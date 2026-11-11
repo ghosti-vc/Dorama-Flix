@@ -6,7 +6,7 @@
   "entry": "plugin.js",
   "author": "ghosti-vc",
   "homepage": "https://github.com/ghosti-vc/Dorama-Flix",
-  "description": "Doramas en español de DoramasFlix y DoramasYT: catálogo, películas, búsqueda y capítulos en latino y subtitulado.",
+  "description": "Películas y series, capítulos en latino y subtitulado.",
   "capabilities": [
     "home",
     "browse",
