@@ -1,7 +1,7 @@
 {
   "id": "dorama-flix",
   "name": "Dorama-Flix",
-  "version": "1.0.10",
+  "version": "1.0.12",
   "apiVersion": 9,
   "entry": "plugin.js",
   "author": "ghosti-vc",
@@ -22,5 +22,6 @@
     "image.tmdb.org"
   ],
   "fetchHosts": "any",
-  "streamHosts": "any"
+  "streamHosts": "any",
+  "browser": true
 }
