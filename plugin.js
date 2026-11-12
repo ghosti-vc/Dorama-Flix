@@ -225,18 +225,24 @@ function mergeDupes(items) {
     if (!g) { g = []; groups.set(k, g); order.push(k); }
     g.push(x);
   }
+  // Cada tarjeta recuerda su título: al abrirla se busca el mismo título en las demás fuentes.
+  const tag = (x) => {
+    const refs = x.ref.startsWith("mx|") ? x.ref.slice(3).split("||") : [x.ref];
+    return Object.assign({}, x, { ref: "mx|" + refs.join("||") + "||tt:" + encodeURIComponent(x.title) + ":" + (x.kind === "movie" ? "m" : "s") });
+  };
   return order.map((k) => {
     const g = groups.get(k);
     const lat = g.some(looksLatino);
-    if (g.length === 1) { if (lat) LATINO_IDS.add(g[0].id); return g[0]; }
+    if (g.length === 1) { const t1 = tag(g[0]); if (lat) LATINO_IDS.add(t1.id); return t1; }
     g.sort((a, b) => (SRC_PRIO[a.ref.slice(0, 2)] || 0) - (SRC_PRIO[b.ref.slice(0, 2)] || 0));
     const first = Object.assign({}, g[0]);
     if (!first.poster) { const p = g.find((y) => y.poster); if (p) first.poster = p.poster; }
     const refs = [];
     for (const y of g) if (refs.indexOf(y.ref) < 0) refs.push(y.ref);
     if (refs.length > 1) first.ref = "mx|" + refs.join("||");
-    if (lat) LATINO_IDS.add(first.id);
-    return first;
+    const t2 = tag(first);
+    if (lat) LATINO_IDS.add(t2.id);
+    return t2;
   });
 }
 
@@ -333,18 +339,18 @@ export async function categories() {
   });
 }
 
-export async function search(query) {
-  await null;
-  const q = stripTags(query && query.q).slice(0, 100);
-  if (!q) return [];
-  let qa = q;
-  if (typeof q.normalize === "function") qa = q.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  qa = qa.replace(/[¡!¿?:,.]/g, " ").replace(/\s+/g, " ").trim() || q;
+// Fuente que falla: se salta 3 minutos para no esperar su tiempo agotado en cada búsqueda.
+const deadUntil = {};
+const guard = (name, fn) => (deadUntil[name] > Date.now()
+  ? Promise.reject(new Error(name + " en pausa"))
+  : Promise.resolve().then(fn).catch((e) => { deadUntil[name] = Date.now() + 3 * 60 * 1000; throw e; }));
+
+// Resultados sin juntar de las dos fuentes (DoramasFlix primero).
+async function searchRaw(qa) {
   const dfSearch = async () => {
     const d = await dfQuery("query S($input:String,$limit:Int){searchDorama(input:$input,limit:$limit){_id slug name name_es poster_path poster} searchMovie(input:$input,limit:$limit){_id slug name name_es poster_path poster}}", { input: qa, limit: 30 });
     return ((d && d.searchDorama) || []).map((x) => dfItem(x, "d")).concat(((d && d.searchMovie) || []).map((x) => dfItem(x, "m"))).filter(Boolean);
   };
-  // DoramasYT: la primera página y, si hay, la segunda.
   const dySearch = async () => {
     const base = DY + "/buscar?q=" + encodeURIComponent(qa);
     const h1 = await getHtml(base);
@@ -354,18 +360,54 @@ export async function search(query) {
     }
     return found;
   };
-  // Se busca en las dos a la vez; en la lista salen primero los de DoramasFlix y después los de DoramasYT.
-  const [f, y] = await Promise.allSettled([dfSearch(), dySearch()]);
+  const [f, y] = await Promise.allSettled([guard("df", dfSearch), guard("dy", dySearch)]);
   if (f.status === "rejected" && y.status === "rejected") throw f.reason;
   if (f.status !== "fulfilled") log("búsqueda: DoramasFlix falló");
   if (y.status !== "fulfilled") log("búsqueda: DoramasYT falló");
-  const all = (f.status === "fulfilled" ? f.value : []).concat(y.status === "fulfilled" ? y.value : []);
+  return (f.status === "fulfilled" ? f.value : []).concat(y.status === "fulfilled" ? y.value : []);
+}
+
+export async function search(query) {
+  await null;
+  const q = stripTags(query && query.q).slice(0, 100);
+  if (!q) return [];
+  let qa = q;
+  if (typeof q.normalize === "function") qa = q.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  qa = qa.replace(/[¡!¿?:,.]/g, " ").replace(/\s+/g, " ").trim() || q;
+  const all = await searchRaw(qa);
   log("búsqueda: " + all.length + " resultados");
-  // Primero lo que viene de DoramasFlix (incluidas las tarjetas combinadas) y, dentro de cada grupo,
-  // los títulos en latino por delante.
   const merged = mergeDupes(all);
   const fromDf = (x) => /^(df\||mx\|df\|)/.test(String(x.ref));
   return latinoFirst(merged.filter(fromDf)).concat(latinoFirst(merged.filter((x) => !fromDf(x)))).slice(0, MAX_RESULTS);
+}
+
+// Separa las fuentes del título y, si falta alguna, busca el mismo título (mismo nombre y tipo) en ella.
+async function expandRefs(raw) {
+  const parts = raw.slice(3).split("||").filter(Boolean);
+  const refs = parts.filter((x) => x.indexOf("tt:") !== 0);
+  const tt = parts.find((x) => x.indexOf("tt:") === 0);
+  const have = new Set(refs.map((r) => r.slice(0, 2)));
+  if (tt && have.size < 2) {
+    const tp = tt.split(":");
+    let title = "";
+    try { title = decodeURIComponent(tp[1] || ""); } catch (e) { /* sin título */ }
+    const qa = title.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[¡!¿?:,.]/g, " ").replace(/\s+/g, " ").trim();
+    const want = normTitle(title);
+    if (qa && want) {
+      try {
+        const found = await withTimeout(searchRaw(qa), 7000);
+        for (const it of found) {
+          const src = it.ref.slice(0, 2);
+          if (have.has(src) || (it.kind === "movie") !== (tp[2] === "m") || normTitle(it.title) !== want) continue;
+          have.add(src);
+          refs.push(it.ref);
+        }
+      } catch (e) { log("buscar en otras fuentes falló: " + String((e && e.message) || e).slice(0, 60)); }
+    }
+  }
+  refs.sort((x, y) => (SRC_PRIO[x.slice(0, 2)] || 0) - (SRC_PRIO[y.slice(0, 2)] || 0));
+  log("fuentes para este título: " + refs.map((r) => r.slice(0, 2)).join(","));
+  return refs.slice(0, 4);
 }
 
 // ---- Episodios --------------------------------------------------------------------------------
@@ -427,8 +469,8 @@ export async function episodes(ref) {
   const raw = String(ref || "");
   // Tarjeta combinada: se piden las listas de todas las fuentes a la vez y gana la que tenga más capítulos.
   if (raw.startsWith("mx|")) {
-    const refs = raw.slice(3).split("||").filter(Boolean).slice(0, 4);
-    const res = await Promise.allSettled(refs.map((r) => episodes(r)));
+    const refs = await expandRefs(raw);
+    const res = await Promise.allSettled(refs.map((r) => withTimeout(episodes(r), 14000)));
     let best = null;
     let bestI = -1;
     res.forEach((r, i) => {
@@ -479,9 +521,10 @@ function absUrl(u) {
 
 // Las cabeceras que el reproductor manda con el video: la página del reproductor como Referer
 // y su origen como Origin (algunos servidores, como Mixdrop, responden 403 si falta alguno).
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 function playHeaders(embedUrl) {
   const m = /^(https?:\/\/[^\/?#]+)/i.exec(String(embedUrl || ""));
-  const h = { Referer: embedUrl };
+  const h = { Referer: embedUrl, "User-Agent": UA };
   if (m) h.Origin = m[1];
   return h;
 }
@@ -706,6 +749,36 @@ function diag(html, depth, found) {
   if (!found && inline.length) log("embed[" + depth + "] script mayor: " + redact(inline[0].body));
 }
 
+// Corta una tarea que tarda demasiado.
+function withTimeout(p, ms) {
+  if (typeof kino.sleep !== "function") return p;
+  const stop = pause(ms).then(() => { throw new Error("tardó demasiado"); });
+  stop.catch(() => {});
+  return Promise.race([Promise.resolve(p), stop]);
+}
+
+// Un video HLS solo vale si su lista abre de verdad. Si no se puede comprobar, queda de reserva (softPool).
+let softPool = [];
+async function verifyMedia(m) {
+  if (!/mpegurl/i.test(String(m && m.mime))) return true;
+  try {
+    const r = await withTimeout(kino.fetch(m.url, { headers: m.headers || {} }), 4500);
+    if (!r.ok) return false;
+    const t = await r.text();
+    return /#EXTM3U/.test(String(t).slice(0, 400));
+  } catch (e) { return false; }
+}
+
+// Streamtape arma el enlace en un script: '//streamtape.com/get_video?...' + ('xcdn...').substring(n)
+function streamtapeMedia(html) {
+  const re = /['"]((?:https?:)?\/\/[^'"\s]*get_video\?[^'"\s]*)['"]\s*\+\s*\(\s*['"]([^'"]*)['"]\s*\)\.substring\(\s*(\d+)\s*\)/g;
+  let m, last = null;
+  while ((m = re.exec(String(html || "")))) last = m;
+  if (!last) return null;
+  const a = last[1].indexOf("//") === 0 ? "https:" + last[1] : last[1];
+  return a + last[2].substring(Number(last[3]));
+}
+
 // Lee la página de un reproductor y busca el video; si no está, sigue los reproductores que esa
 // página abre (hasta 2 niveles).
 async function embedFromHtml(embedUrl, depth, referer) {
@@ -724,6 +797,7 @@ async function embedFromHtml(embedUrl, depth, referer) {
   }
 
   let u = deepMedia(html);
+  if (!u && /streamtape/i.test(hostOf(embedUrl))) { u = streamtapeMedia(html); if (u) log("streamtape: video encontrado"); }
   // Una página diminuta, sin video ni enlaces, suele ser una pantalla de comprobación del servidor:
   // con la cookie que acaba de dejar, el segundo intento trae la página real. Un solo reintento.
   if (!u && d >= 1 && html.length < 3000 && !/byse/i.test(hostOf(embedUrl)) && !embedLinks(html, embedUrl).length) {
@@ -738,7 +812,13 @@ async function embedFromHtml(embedUrl, depth, referer) {
   diag(html, d, !!u);
   if (u) {
     log("embed[" + d + "] video elegido: " + hostOf(u) + pathShape(u));
-    return { url: u, mime: /\.m3u8/i.test(u) ? "application/x-mpegurl" : "video/mp4", headers: playHeaders(embedUrl) };
+    const found = { url: u, mime: /\.m3u8/i.test(u) ? "application/x-mpegurl" : "video/mp4", headers: playHeaders(embedUrl) };
+    if (!(await verifyMedia(found))) {
+      log("embed[" + d + "] el video de " + hostOf(u) + " no se pudo comprobar, queda de reserva");
+      if (!/dood|do7go|d0000d|mixdrop|netu|waaw|hqq|nupload/i.test(hostOf(u))) softPool.push(Object.assign({ label: hostOf(embedUrl) }, found));
+      return null;
+    }
+    return found;
   }
   if (d >= 2) return null;
   const links = embedLinks(html, embedUrl).filter((l) => !/byse/i.test(hostOf(l))).slice(0, d === 0 ? 3 : 2);
@@ -751,6 +831,53 @@ async function embedFromHtml(embedUrl, depth, referer) {
     }
   }
   return null;
+}
+
+// ---- Navegador oculto ---------------------------------------------------------------------------
+
+let resolveT0 = 0;
+let captureBusy = false;
+const WEAK = /abyss|dood|do7go|d0000d|mixdrop|susanexpect|nupload|waaw|hqq|netu|byse|hgcloud/i;
+
+async function captureEmbed(embedUrl, ms) {
+  if (typeof kino === "undefined" || !kino.browser || typeof kino.browser.capture !== "function") return null;
+  const page = await kino.browser.capture(embedUrl, { timeoutMs: ms, headers: { Referer: DF + "/" } });
+  const media = page && Array.isArray(page.media) ? page.media : [];
+  const first = media.find((x) => x && typeof x.url === "string" && /^https?:\/\//.test(x.url) && !isDemo(x.url));
+  if (!first) return null;
+  const out = { url: first.url, mime: first.mime || first.mimeType || (/\.m3u8(\?|$)/i.test(first.url) ? "application/x-mpegurl" : "video/mp4") };
+  if (first.headers && typeof first.headers === "object") out.headers = first.headers;
+  return out;
+}
+
+// Lee los reproductores de una vez (gana el primero que entregue video). Si a los 3 s nadie ha entregado nada,
+// el navegador oculto arranca en paralelo con uno de los reproductores (uno solo a la vez en todo el capítulo).
+// embeds: [{ url, name, label }]. Devuelve { v } o null.
+async function raceWithBrowser(tasks, embeds) {
+  const staticP = firstSuccess(tasks);
+  const usable = embeds.filter((e) => e && e.url && !/\.(?:m3u8|mp4)(\?|$)/i.test(e.url));
+  const canBrowser = typeof kino.sleep === "function" && kino.browser && typeof kino.browser.capture === "function" && usable.length && !captureBusy;
+  if (!canBrowser) return staticP;
+  const first = await Promise.race([staticP, pause(3000).then(() => "slow")]);
+  if (first && first !== "slow") return first;
+  if (captureBusy) return first === "slow" ? staticP : null;
+  captureBusy = true;
+  log(first === "slow" ? "resolve: 3 s sin video, el navegador oculto arranca en paralelo" : "resolve: sin video, se prueba el navegador oculto");
+  const cap = (async () => {
+    const left = 17000 - (Date.now() - (resolveT0 || Date.now()));
+    const fe = usable.find((e) => !WEAK.test(e.url + " " + (e.name || ""))) || usable[0];
+    if (left < 5000) return null;
+    try {
+      const res = await captureEmbed(fe.url, Math.min(12000, left - 1500));
+      if (res) { res.label = fe.label; return res; }
+      log("resolve: el navegador no vio video");
+    } catch (e) {
+      log("resolve: captura falló " + String((e && e.message) || e).slice(0, 60));
+    }
+    return null;
+  })().then((r) => { captureBusy = false; return r; }, (e) => { captureBusy = false; throw e; });
+  const both = await firstSuccess([staticP.then((r) => (r ? r.v : null)), cap]);
+  return both ? { v: both.v } : null;
 }
 
 // Devuelve el primer resultado que llegue (no el último): { v, i } o null si ninguno entrega nada.
@@ -797,11 +924,9 @@ async function dyResolve(url) {
   const lat = /-latino-/i.test(url);
   const label = (b) => (lat ? "Latino" : tr("Subtitulado", "Subbed")) + " · " + b.name;
   // El reproductor de la página es un iframe a /reproductor?video=<código>&player=<nombre>.
-  const tasks = cands.map((b) => {
-    const pu = DY + "/reproductor?video=" + b.token + "&player=" + encodeURIComponent(b.name) + "&token=";
-    return embedFromHtml(pu, 0, url).then((v) => (v ? Object.assign(v, { label: label(b) }) : null));
-  });
-  const first = await firstSuccess(tasks);
+  const pus = cands.map((b) => DY + "/reproductor?video=" + b.token + "&player=" + encodeURIComponent(b.name) + "&token=");
+  const tasks = cands.map((b, i) => embedFromHtml(pus[i], 0, url).then((v) => (v ? Object.assign(v, { label: label(b) }) : null)));
+  const first = await raceWithBrowser(tasks, cands.map((b, i) => ({ url: pus[i], name: b.name, label: label(b) })));
   if (first) return first.v;
   throw NO_VIDEO();
 }
@@ -866,46 +991,79 @@ async function dfResolve(spec) {
   // Primero solo los servidores en latino; si ninguno abre, se prueban los demás.
   const lat = all.filter((x) => x.latino).map((x) => x.u);
   const otros = all.filter((x) => !x.latino).map((x) => x.u);
+  const emb = (us) => us.map((u) => ({ url: u, name: hostOf(u), label: (langOf[u] ? langOf[u] + " · " : "DoramasFlix · ") + hostOf(u) }));
   if (lat.length) {
-    const fl = await firstSuccess(lat.slice(0, 3).map(one));
+    const l3 = lat.slice(0, 3);
+    const fl = await raceWithBrowser(l3.map(one), emb(l3));
     if (fl) return fl.v;
     log("df resolve: el latino no abrió, se prueba el otro idioma");
   }
-  const first = await firstSuccess((lat.length ? otros : links).slice(0, 4).map(one));
+  const rest = (lat.length ? otros : links).slice(0, 4);
+  const first = await raceWithBrowser(rest.map(one), emb(rest));
   if (first) return first.v;
   throw NO_VIDEO();
 }
 
 // ---- Reproducción: capítulo con varias fuentes -------------------------------------------------
 
-// Se prueba la primera fuente y, si falla o tarda, se pasa a la siguiente.
-// Prioridad a latino: si una fuente solo entrega subtitulado, se prueban las demás por si alguna lo tiene
-// en latino; si ninguna, se queda con el subtitulado.
+// Las fuentes arrancan una tras otra (cada 4 s o en cuanto la anterior falla) sin soltar las anteriores;
+// gana el primer Latino. Si llega antes un Subtitulado, se da un momento a que termine un Latino pendiente.
 async function resolveAny(refs) {
   const t0 = Date.now();
+  const left = () => 17000 - (Date.now() - t0);
   let lastErr = null;
-  let fallback = null;
-  const canRace = typeof kino.sleep === "function";
-  const isSub = (s) => /^(Subtitulado|Subbed)/.test(String((s && s.label) || ""));
-  for (let i = 0; i < refs.length; i++) {
-    const left = 19000 - (Date.now() - t0);
-    if (left < 3500) break;
-    const cap = i === refs.length - 1 ? left : Math.min(left, 9000);
-    log("resolve: fuente " + (i + 1) + "/" + refs.length + " (" + refs[i].slice(0, 2) + ")");
-    const attempt = resolve(refs[i]).catch((e) => { lastErr = e; log("resolve: " + refs[i].slice(0, 2) + " falló"); return null; });
-    // OJO: kino.sleep solo acepta hasta 5000 ms; pause() hace las esperas largas por tramos.
-    const got = canRace ? await Promise.race([attempt, pause(cap)]) : await attempt;
-    if (got && !isSub(got)) return got;
-    if (got && !fallback) { fallback = got; log("resolve: solo subtitulado en " + refs[i].slice(0, 2) + ", se busca latino en las otras fuentes"); }
+  let winner = null;
+  let pending = 0;
+  let next = 0;
+  let lastLaunch = 0;
+  let winAt = 0;
+  const rankOf = (v) => (/^Latino/i.test(String((v && v.label) || "")) ? 0 : 1);
+  const launch = (r) => {
+    pending++;
+    log("resolve: fuente " + next + "/" + refs.length + " (" + r.slice(0, 2) + ")");
+    resolveInner(r).then((v) => {
+      if (!v) return;
+      const k = rankOf(v);
+      if (!winner || k < winner.k) { winner = { v, k }; if (!winAt) winAt = Date.now(); }
+    }).catch((e) => { lastErr = e; log("resolve: " + r.slice(0, 2) + " falló"); }).then(() => { pending--; });
+  };
+  while (left() > 800) {
+    const settle = Math.max(winAt, lastLaunch);
+    if (winner) {
+      if (winner.k === 0) break;
+      if (next < refs.length && left() > 6000) { launch(refs[next++]); lastLaunch = Date.now(); continue; }
+      if (pending === 0 || Date.now() - settle > 6000) break;
+    } else if (next < refs.length && (pending === 0 || Date.now() - lastLaunch > 4000)) {
+      launch(refs[next++]);
+      lastLaunch = Date.now();
+      continue;
+    } else if (pending === 0 && next >= refs.length) break;
+    await kino.sleep(250);
   }
-  if (fallback) return fallback;
-  throw lastErr || NO_VIDEO();
+  if (winner) return winner.v;
+  throw lastErr && lastErr.code ? lastErr : NO_VIDEO();
 }
 
+// Si ningún servidor pasó la comprobación, se entrega el primer video de reserva en vez de fallar.
 export async function resolve(ref) {
   await null;
+  softPool = [];
+  resolveT0 = Date.now();
+  try {
+    return await resolveInner(ref);
+  } catch (e) {
+    if (softPool.length) {
+      log("resolve: se entrega el video de reserva (" + softPool[0].label + ")");
+      return softPool[0];
+    }
+    throw e;
+  }
+}
+
+async function resolveInner(ref) {
+  await null;
   const raw = String(ref || "");
-  if (raw.startsWith("mx|")) return resolveAny(raw.slice(3).split("||").filter(Boolean).slice(0, 3));
+  if (raw.startsWith("mx|")) return resolveAny(raw.slice(3).split("||").filter((x) => x && x.indexOf("tt:") !== 0).slice(0, 6));
   if (raw.startsWith("df|")) return dfResolve(raw.slice(3));
   if (raw.startsWith("dy|")) return dyResolve(raw.slice(3));
   throw kino.error("not_found", "referencia desconocida");
